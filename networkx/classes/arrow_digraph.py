@@ -21,6 +21,25 @@ def _typed_column(values):
         return pa.array([None if v is None else str(v) for v in values])
 
 
+def _partition_by_type(table, column):
+    """Split ``table`` into ``{type value: frame}`` preserving full rows."""
+    if table.num_rows == 0:
+        return {}
+    if column not in table.column_names:
+        return {None: table}
+    values = table.column(column)
+    frames = {}
+    for type_value in pc.unique(values).to_pylist():
+        if type_value is None:
+            mask = pc.is_null(values)
+        else:
+            mask = pc.equal(values, type_value)
+        frame = pc.take(table, pc.indices_nonzero(mask))
+        if frame.num_rows:
+            frames[type_value] = frame
+    return frames
+
+
 class ArrowDiGraph:
     """Minimal directed graph with nodes/edges + attrs in Arrow tables."""
 
@@ -320,6 +339,22 @@ class ArrowDiGraph:
     def edges_table(self):
         self._sync()
         return self._edges_table
+
+    def partition_tables(self):
+        """Split node/edge tables into ``{type: frame}`` dicts for bulk storage.
+
+        Each distinct ``node_type``/``edge_type`` gets its own frame holding
+        the full rows (key columns included, so endpoints stay resolvable).
+        Rows without a type are grouped under the ``None`` key; tables with
+        no type column at all yield a single ``None``-keyed frame. Empty
+        frames are omitted. Column-to-field mapping is left to the storage
+        provider, which knows its own schema.
+        """
+        self._sync()
+        return (
+            _partition_by_type(self._nodes_table, "node_type"),
+            _partition_by_type(self._edges_table, "edge_type"),
+        )
 
     def as_writeable(self):
         """Fall back to a dict-backed ``DiGraph`` for write-heavy work.

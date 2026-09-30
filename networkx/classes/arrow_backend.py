@@ -21,6 +21,10 @@ Usage::
     nx.out_degree_centrality(G, backend="arrow")  # explicit, converts + caches
     NETWORKX_BACKEND_PRIORITY=arrow python script.py  # automatic
 
+Columnar stores hook in through :func:`register_storage_provider` and
+persist whole graphs with :func:`persist`, which hands over per-type
+node frames first and edge frames second.
+
 Registered under the ``networkx.backends`` entry-point name ``arrow``.
 """
 
@@ -28,7 +32,88 @@ import pyarrow.compute as pc
 
 from .arrow_digraph import ArrowDiGraph
 
-__all__ = ["ArrowDiGraph", "ArrowBackendInterface", "backend_interface"]
+__all__ = [
+    "ArrowDiGraph",
+    "ArrowBackendInterface",
+    "backend_interface",
+    "register_storage_provider",
+    "unregister_storage_provider",
+    "get_storage_provider",
+    "list_storage_providers",
+    "persist",
+]
+
+
+# -- storage provider registry --------------------------------------------
+# A storage provider bulk-loads columnar frames into an external store.
+# It is any object with two methods (extra keyword arguments are passed
+# through untouched):
+#
+#     store_nodes(node_frames) -> dict[str, int]
+#     store_edges(edge_frames) -> dict[str, int]
+#
+# ``node_frames`` / ``edge_frames`` map a type name (or ``None`` for
+# untagged rows) to a ``pyarrow.Table`` holding the full rows. Node frames
+# are always handed over before edge frames so providers can resolve
+# endpoints against stored nodes; empty frames are never passed.
+# Providers register under a name and are referenced by that name from
+# :func:`persist`. Column-to-field mapping is the provider's job: it
+# knows its own stored schema and projects/selects frame columns itself.
+
+_storage_providers = {}
+
+
+def register_storage_provider(name, provider):
+    """Register a bulk-storage provider under ``name``.
+
+    ``provider`` must define ``store_nodes`` and ``store_edges`` as
+    described above. Re-registering a name replaces the old provider.
+    """
+    for method in ("store_nodes", "store_edges"):
+        if not callable(getattr(provider, method, None)):
+            raise TypeError(
+                f"storage provider {name!r} must define a {method}() method"
+            )
+    _storage_providers[name] = provider
+    return provider
+
+
+def unregister_storage_provider(name):
+    """Remove the provider registered under ``name`` (``KeyError`` if absent)."""
+    del _storage_providers[name]
+
+
+def get_storage_provider(name):
+    """Return the provider registered under ``name`` (``KeyError`` if absent)."""
+    return _storage_providers[name]
+
+
+def list_storage_providers():
+    """Return the sorted names of all registered storage providers."""
+    return sorted(_storage_providers)
+
+
+def persist(graph, provider, **kwargs):
+    """Bulk-persist a graph through a registered storage provider.
+
+    ``graph`` is an ``ArrowDiGraph`` (plain NetworkX graphs are converted
+    first); ``provider`` is a registered name or a provider object. The
+    graph is partitioned into per-type frames, node frames are stored
+    before edge frames, and per-table row counts are merged into one
+    ``{table_name: rows}`` dict.
+    """
+    if isinstance(provider, str):
+        provider = get_storage_provider(provider)
+    for method in ("store_nodes", "store_edges"):
+        if not callable(getattr(provider, method, None)):
+            raise TypeError(f"storage provider must define a {method}() method")
+    if not isinstance(graph, ArrowDiGraph):
+        graph = ArrowDiGraph.from_networkx(graph)
+    node_frames, edge_frames = graph.partition_tables()
+    return {
+        **provider.store_nodes(node_frames, **kwargs),
+        **provider.store_edges(edge_frames, **kwargs),
+    }
 
 
 class ArrowBackendInterface:

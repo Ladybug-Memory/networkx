@@ -4,7 +4,14 @@ pa = pytest.importorskip("pyarrow")
 pc = pytest.importorskip("pyarrow.compute")
 
 import networkx as nx
-from networkx.classes.arrow_backend import backend_interface
+from networkx.classes.arrow_backend import (
+    backend_interface,
+    get_storage_provider,
+    list_storage_providers,
+    persist,
+    register_storage_provider,
+    unregister_storage_provider,
+)
 from networkx.classes.arrow_digraph import ArrowDiGraph
 
 
@@ -105,6 +112,86 @@ def test_type_columns_omitted_when_unused():
     g.remove_node("a")
     assert "node_type" not in g.nodes_table().column_names
     assert "edge_type" not in g.edges_table().column_names
+
+
+def test_storage_provider_hook(typed_graph):
+    calls = []
+
+    class RecordingProvider:
+        def store_nodes(self, frames, **kwargs):
+            calls.append(("nodes", sorted(frames), kwargs))
+            return {k: t.num_rows for k, t in frames.items()}
+
+        def store_edges(self, frames, **kwargs):
+            calls.append(("edges", sorted(frames), kwargs))
+            return {k: t.num_rows for k, t in frames.items()}
+
+    register_storage_provider("recording", RecordingProvider())
+    try:
+        assert "recording" in list_storage_providers()
+        assert get_storage_provider("recording") is not None
+        counts = persist(typed_graph, "recording", tag="t")
+        assert counts == {
+            "user": 2,
+            "post": 1,
+            "authored": 1,
+            "liked": 1,
+            "follows": 1,
+        }
+        # nodes are handed over before edges, kwargs pass through
+        assert [c[0] for c in calls] == ["nodes", "edges"]
+        assert calls[0][1] == ["post", "user"]
+        assert calls[1][1] == ["authored", "follows", "liked"]
+        assert calls[0][2] == {"tag": "t"}
+        # plain NetworkX graphs are converted first
+        assert persist(typed_graph.to_networkx(), "recording") == counts
+    finally:
+        unregister_storage_provider("recording")
+    assert "recording" not in list_storage_providers()
+
+
+def test_storage_provider_hook_rejects_bad_providers():
+    with pytest.raises(TypeError):
+        register_storage_provider("bad", object())
+    with pytest.raises(KeyError):
+        get_storage_provider("no-such-provider")
+    with pytest.raises(KeyError):
+        unregister_storage_provider("no-such-provider")
+    with pytest.raises(TypeError):
+        persist(ArrowDiGraph(), object())
+
+
+def test_storage_provider_hook_skips_empty_frames():
+    seen = {}
+
+    class RecordingProvider:
+        def store_nodes(self, frames, **kwargs):
+            seen["nodes"] = frames
+            return {}
+
+        def store_edges(self, frames, **kwargs):
+            seen["edges"] = frames
+            return {}
+
+    persist(ArrowDiGraph(), RecordingProvider())
+    assert seen == {"nodes": {}, "edges": {}}
+
+    g = ArrowDiGraph()
+    g.add_node("a", node_type="user")
+    persist(g, RecordingProvider())
+    assert list(seen["nodes"]) == ["user"]
+    assert seen["edges"] == {}
+
+
+def test_partition_tables_untyped():
+    g = ArrowDiGraph()
+    g.add_edge("a", "b")
+    nodes, edges = g.partition_tables()
+    assert list(nodes) == [None] and nodes[None].num_rows == 2
+    assert list(edges) == [None] and edges[None].num_rows == 1
+    assert "node" in nodes[None].column_names
+    assert "source" in edges[None].column_names
+    assert "target" in edges[None].column_names
 
 
 def test_backend_constructors():
