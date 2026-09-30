@@ -1,5 +1,6 @@
 from .graph import Graph
 from .digraph import DiGraph
+from .arrow_digraph import ArrowDiGraph
 from .multigraph import MultiGraph
 from .multidigraph import MultiDiGraph
 
