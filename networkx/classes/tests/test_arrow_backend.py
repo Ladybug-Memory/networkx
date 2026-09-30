@@ -13,6 +13,7 @@ from networkx.classes.arrow_backend import (
     unregister_storage_provider,
 )
 from networkx.classes.arrow_digraph import ArrowDiGraph
+from networkx.classes.arrow_parquet import ParquetStorageProvider
 
 
 @pytest.fixture
@@ -192,6 +193,62 @@ def test_partition_tables_untyped():
     assert "node" in nodes[None].column_names
     assert "source" in edges[None].column_names
     assert "target" in edges[None].column_names
+
+
+def _assert_graphs_equal(original, restored):
+    assert restored.node_types == original.node_types
+    assert restored.edge_types == original.edge_types
+    assert restored.nodes_table().num_rows == original.nodes_table().num_rows
+    assert restored.edges_table().num_rows == original.edges_table().num_rows
+    for node in original.nodes:
+        assert restored.has_node(node)
+        assert restored.node_attrs(node) == original.node_attrs(node)
+    for u, v in original.edges:
+        assert restored.has_edge(u, v)
+        assert restored.edge_attrs(u, v) == original.edge_attrs(u, v)
+    assert restored.graph == original.graph
+
+
+def test_parquet_provider_roundtrip(tmp_path, typed_graph):
+    typed_graph.graph["name"] = "roundtrip"
+    provider = ParquetStorageProvider(tmp_path / "store")
+    counts = persist(typed_graph, provider, graph_attrs=typed_graph.graph)
+    assert sum(counts.values()) == 6
+    assert (tmp_path / "store" / "manifest.json").exists()
+    assert sorted((tmp_path / "store" / "nodes").glob("*.parquet")) != []
+
+    restored = provider.load_graph()
+    _assert_graphs_equal(typed_graph, restored)
+    # per-type files: 2 node types + 3 edge types
+    assert len(list((tmp_path / "store" / "nodes").glob("*.parquet"))) == 2
+    assert len(list((tmp_path / "store" / "edges").glob("*.parquet"))) == 3
+
+
+def test_parquet_provider_roundtrip_untyped_and_empty(tmp_path):
+    provider = ParquetStorageProvider(tmp_path / "store")
+    g = ArrowDiGraph()
+    g.add_edge("a", "b", weight=1.5)
+    persist(g, provider)
+    restored = provider.load_graph()
+    _assert_graphs_equal(g, restored)
+    assert restored.nodes_table().column_names == ["node"]
+
+    persist(ArrowDiGraph(), provider)
+    empty = provider.load_graph()
+    assert empty.number_of_nodes() == 0
+    assert empty.number_of_edges() == 0
+
+
+def test_parquet_provider_repersist_drops_stale_files(tmp_path, typed_graph):
+    provider = ParquetStorageProvider(tmp_path / "store")
+    persist(typed_graph, provider)
+    assert len(list((tmp_path / "store" / "edges").glob("*.parquet"))) == 3
+
+    typed_graph.remove_edge("alice", "bob")  # drops the only "follows" edge
+    typed_graph.remove_edge("bob", "post1")  # drops the only "liked" edge
+    persist(typed_graph, provider)
+    assert len(list((tmp_path / "store" / "edges").glob("*.parquet"))) == 1
+    _assert_graphs_equal(typed_graph, provider.load_graph())
 
 
 def test_backend_constructors():
