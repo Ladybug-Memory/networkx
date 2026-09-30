@@ -1,10 +1,9 @@
-"""Directed graph backed by ``pyarrow.Table`` for node and edge storage.
+"""Directed graph backed by ``pyarrow.Table`` for nodes and edges.
 
-Nodes live in a single-column table (``node``) and edges in a
-``source``/``target`` table. Attribute dicts are kept alongside for O(1)
-Python-level lookup; the tables are the source of truth for membership
-and give columnar memory layout plus zero-copy analytics (filter,
-group-by, join) via the Arrow compute API.
+Nodes: ``node`` key column + one typed column per homogeneous attribute.
+Edges: ``source``/``target`` key columns + one typed column per attribute.
+Missing values are null. Columns are (dictionary-)encoded by Arrow, so
+large homogeneous attrs use far less memory than per-object Python dicts.
 """
 
 import pyarrow as pa
@@ -13,34 +12,46 @@ import pyarrow.compute as pc
 __all__ = ["ArrowDiGraph"]
 
 
+def _typed_column(values):
+    try:
+        return pa.array(values)
+    except Exception:
+        return pa.array([None if v is None else str(v) for v in values])
+
+
 class ArrowDiGraph:
-    """Minimal directed graph with edges in a ``pyarrow.Table``."""
+    """Minimal directed graph with nodes/edges + attrs in Arrow tables."""
 
     def __init__(self, incoming_graph_data=None):
-        self._node_attrs = {}
-        self._edge_attrs = {}  # (u, v) -> dict
-        self._nodes_table = pa.table(
-            {"node": pa.array([], type=pa.string())}
-        )
+        self._node_order = []  # string keys, insertion order
+        self._node_orig = {}  # key -> original object
+        self._node_cols = {}  # attr name -> list aligned with _node_order
+        self._edge_order = []  # (skey, tkey) tuples
+        self._edge_cols = {}
+        self._nodes_table = pa.table({"node": pa.array([], type=pa.string())})
         self._edges_table = pa.table(
             {"source": pa.array([], type=pa.string()),
              "target": pa.array([], type=pa.string())}
         )
         if incoming_graph_data is not None:
-            self.add_edges_from(incoming_graph_data.edges())
             for n, d in incoming_graph_data.nodes(data=True):
                 self.add_node(n, **d)
+            for u, v, d in incoming_graph_data.edges(data=True):
+                self.add_edge(u, v, **d)
 
     # -- nodes --
     def add_node(self, node, **attrs):
         key = str(node)
-        is_new = key not in self._node_attrs
-        if is_new:
-            self._node_attrs[key] = {"_orig": node}
-            self._nodes_table = pa.concat_tables(
-                [self._nodes_table, pa.table({"node": [key]})]
-            )
-        self._node_attrs[key].update(attrs)
+        if key not in self._node_orig:
+            self._node_orig[key] = node
+            self._node_order.append(key)
+            for name in self._node_cols:
+                self._node_cols[name].append(None)
+        idx = self._node_order.index(key)
+        for name, val in attrs.items():
+            self._node_cols.setdefault(name, [None] * len(self._node_order))
+            self._node_cols[name][idx] = val
+        self._rebuild_nodes_table()
 
     def add_nodes_from(self, nodes):
         for n in nodes:
@@ -50,100 +61,115 @@ class ArrowDiGraph:
                 self.add_node(n)
 
     def has_node(self, node):
-        return str(node) in self._node_attrs
+        return str(node) in self._node_orig
 
     def remove_node(self, node):
         key = str(node)
-        if key not in self._node_attrs:
+        if key not in self._node_orig:
             raise KeyError(node)
-        del self._node_attrs[key]
-        kill = [(u, v) for (u, v) in self._edge_attrs if u == key or v == key]
-        for e in kill:
-            del self._edge_attrs[e]
+        idx = self._node_order.index(key)
+        del self._node_order[idx]
+        del self._node_orig[key]
+        for name in self._node_cols:
+            del self._node_cols[name][idx]
+        keep = [(s, t) for (s, t) in self._edge_order if s != key and t != key]
+        drop = set(self._edge_order) - set(keep)
+        if drop:
+            idxs = [i for i, e in enumerate(self._edge_order) if e in drop]
+            for i in sorted(idxs, reverse=True):
+                del self._edge_order[i]
+                for name in self._edge_cols:
+                    del self._edge_cols[name][i]
         self._rebuild_nodes_table()
-        self._rebuild_table()
+        self._rebuild_edges_table()
+
+    def node_attrs(self, node):
+        key = str(node)
+        idx = self._node_order.index(key)
+        return {n: c[idx] for n, c in self._node_cols.items() if c[idx] is not None}
 
     @property
     def nodes(self):
-        return [d["_orig"] for d in self._node_attrs.values()]
+        return [self._node_orig[k] for k in self._node_order]
 
     def number_of_nodes(self):
-        return len(self._node_attrs)
+        return len(self._node_order)
 
     # -- edges --
     def add_edge(self, u, v, **attrs):
         self.add_node(u)
         self.add_node(v)
         key = (str(u), str(v))
-        if key not in self._edge_attrs:
-            self._edge_attrs[key] = {}
-            self._edges_table = pa.concat_tables(
-                [
-                    self._edges_table,
-                    pa.table({"source": [key[0]], "target": [key[1]]}),
-                ]
-            )
-        self._edge_attrs[key].update(attrs)
+        if key not in self._edge_order:
+            self._edge_order.append(key)
+            for name in self._edge_cols:
+                self._edge_cols[name].append(None)
+        idx = self._edge_order.index(key)
+        for name, val in attrs.items():
+            self._edge_cols.setdefault(name, [None] * len(self._edge_order))
+            self._edge_cols[name][idx] = val
+        self._rebuild_edges_table()
 
     def add_edges_from(self, ebunch):
         for e in ebunch:
             if len(e) == 2:
                 self.add_edge(*e)
             else:
-                u, v, d = e[0], e[1], e[2]
-                self.add_edge(u, v, **d)
+                self.add_edge(e[0], e[1], **e[2])
 
     def has_edge(self, u, v):
-        return (str(u), str(v)) in self._edge_attrs
+        return (str(u), str(v)) in self._edge_order
 
     def remove_edge(self, u, v):
         key = (str(u), str(v))
-        if key not in self._edge_attrs:
+        if key not in self._edge_order:
             raise KeyError((u, v))
-        del self._edge_attrs[key]
-        self._rebuild_table()
+        idx = self._edge_order.index(key)
+        del self._edge_order[idx]
+        for name in self._edge_cols:
+            del self._edge_cols[name][idx]
+        self._rebuild_edges_table()
+
+    def edge_attrs(self, u, v):
+        idx = self._edge_order.index((str(u), str(v)))
+        return {n: c[idx] for n, c in self._edge_cols.items() if c[idx] is not None}
 
     def successors(self, node):
         key = str(node)
-        return [self._node_attrs[t]["_orig"] for (s, t) in self._edge_attrs if s == key]
+        return [self._node_orig[t] for (s, t) in self._edge_order if s == key]
 
     def predecessors(self, node):
         key = str(node)
-        return [self._node_attrs[s]["_orig"] for (s, t) in self._edge_attrs if t == key]
+        return [self._node_orig[s] for (s, t) in self._edge_order if t == key]
 
     @property
     def edges(self):
-        return [
-            (
-                self._node_attrs[s]["_orig"],
-                self._node_attrs[t]["_orig"],
-            )
-            for (s, t) in self._edge_attrs
-        ]
+        return [(self._node_orig[s], self._node_orig[t]) for (s, t) in self._edge_order]
 
     def number_of_edges(self):
-        return len(self._edge_attrs)
+        return len(self._edge_order)
 
     # -- arrow-native --
     def nodes_table(self):
-        """Return the underlying ``pyarrow.Table`` of nodes."""
         return self._nodes_table
 
     def edges_table(self):
-        """Return the underlying ``pyarrow.Table`` of edges."""
         return self._edges_table
 
     @classmethod
-    def from_arrow(cls, table):
+    def from_arrow(cls, nodes=None, edges=None):
         g = cls()
-        for s, t in zip(
-            table.column("source").to_pylist(), table.column("target").to_pylist()
-        ):
-            g.add_edge(s, t)
+        if nodes is not None:
+            pylist = nodes.to_pylist()
+            for row in pylist:
+                g.add_node(row.pop("node"), **{k: v for k, v in row.items() if v is not None})
+        if edges is not None:
+            for row in edges.to_pylist():
+                s, t = row.pop("source"), row.pop("target")
+                g.add_edge(s, t, **{k: v for k, v in row.items() if v is not None})
         return g
 
     def out_degree_table(self):
-        """Arrow table of (node, out_degree) via ``pyarrow.compute``."""
         if self._edges_table.num_rows == 0:
             return pa.table(
                 {"node": pa.array([], type=pa.string()),
@@ -161,30 +187,32 @@ class ArrowDiGraph:
         import networkx as nx
 
         g = nx.DiGraph()
-        for key, attrs in self._node_attrs.items():
-            g.add_node(attrs["_orig"], **{k: v for k, v in attrs.items() if k != "_orig"})
-        for (s, t), attrs in self._edge_attrs.items():
-            g.add_edge(self._node_attrs[s]["_orig"], self._node_attrs[t]["_orig"], **attrs)
+        for i, k in enumerate(self._node_order):
+            g.add_node(
+                self._node_orig[k],
+                **{n: c[i] for n, c in self._node_cols.items() if c[i] is not None},
+            )
+        for i, (s, t) in enumerate(self._edge_order):
+            g.add_edge(
+                self._node_orig[s], self._node_orig[t],
+                **{n: c[i] for n, c in self._edge_cols.items() if c[i] is not None},
+            )
         return g
 
     def _rebuild_nodes_table(self):
-        keys = list(self._node_attrs)
-        self._nodes_table = pa.table({"node": pa.array(keys, type=pa.string())})
+        cols = {"node": pa.array(self._node_order, type=pa.string())}
+        for name, vals in self._node_cols.items():
+            cols[name] = _typed_column(list(vals))
+        self._nodes_table = pa.table(cols)
 
-    def _rebuild_table(self):
-        if not self._edge_attrs:
-            self._edges_table = pa.table(
-                {"source": pa.array([], type=pa.string()),
-                 "target": pa.array([], type=pa.string())}
-            )
-        else:
-            keys = list(self._edge_attrs)
-            self._edges_table = pa.table(
-                {
-                    "source": [k[0] for k in keys],
-                    "target": [k[1] for k in keys],
-                }
-            )
+    def _rebuild_edges_table(self):
+        cols = {
+            "source": pa.array([s for s, _ in self._edge_order], type=pa.string()),
+            "target": pa.array([t for _, t in self._edge_order], type=pa.string()),
+        }
+        for name, vals in self._edge_cols.items():
+            cols[name] = _typed_column(list(vals))
+        self._edges_table = pa.table(cols)
 
     def __len__(self):
         return self.number_of_nodes()
