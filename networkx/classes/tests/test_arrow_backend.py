@@ -86,6 +86,27 @@ def test_bulk_ingest_matches_incremental():
     assert from_nx.node_attrs(0) == incr.node_attrs(0)
 
 
+def test_type_columns_omitted_when_unused():
+    g = ArrowDiGraph()
+    g.add_node("a", color="red")
+    g.add_edge("a", "b", weight=1.0)
+    assert "node_type" not in g.nodes_table().column_names
+    assert "edge_type" not in g.edges_table().column_names
+    assert g.nodes_of_type("user") == []
+    assert g.edges_of_type("likes") == []
+    assert g.node_types == [] and g.edge_types == []
+    # setting a type later materializes the column ...
+    g.add_node("a", node_type="user")
+    g.add_edge("a", "b", edge_type="likes")
+    assert g.nodes_table().column("node_type").to_pylist() == ["user", None]
+    assert g.edges_table().column("edge_type").to_pylist() == ["likes"]
+    # ... and removing every typed entry drops it again
+    g.remove_edge("a", "b")
+    g.remove_node("a")
+    assert "node_type" not in g.nodes_table().column_names
+    assert "edge_type" not in g.edges_table().column_names
+
+
 def test_backend_constructors():
     g = nx.Graph(backend="arrow")
     d = nx.DiGraph(backend="arrow")

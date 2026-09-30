@@ -1,9 +1,10 @@
 """Directed graph backed by ``pyarrow.Table`` for nodes and edges.
 
-Nodes: ``node`` key column + reserved ``node_type`` column + one typed
-column per homogeneous attribute. Edges: ``source``/``target`` key
-columns + reserved ``edge_type`` column + one typed column per attribute.
-Missing values are null. Columns are (dictionary-)encoded by Arrow, so
+Nodes: ``node`` key column + one typed column per homogeneous attribute.
+Edges: ``source``/``target`` key columns + one typed column per attribute.
+Reserved ``node_type``/``edge_type`` columns are materialized only when at
+least one node/edge actually has a type, so single-type (or untyped)
+graphs pay nothing for the feature. Missing values are null. Columns are (dictionary-)encoded by Arrow, so
 large homogeneous attrs use far less memory than per-object Python dicts.
 """
 
@@ -98,6 +99,8 @@ class ArrowDiGraph:
     def nodes_of_type(self, node_type):
         """Nodes of a given type, filtered in Arrow (no Python scan)."""
         self._sync()
+        if "node_type" not in self._nodes_table.column_names:
+            return []
         mask = pc.equal(self._nodes_table.column("node_type"), node_type)
         keys = pc.take(
             self._nodes_table.column("node"), pc.indices_nonzero(mask)
@@ -215,6 +218,8 @@ class ArrowDiGraph:
     def edges_of_type(self, edge_type):
         """Edges of a given type, filtered in Arrow (no Python scan)."""
         self._sync()
+        if "edge_type" not in self._edges_table.column_names:
+            return []
         mask = pc.equal(self._edges_table.column("edge_type"), edge_type)
         rows = pc.take(self._edges_table, pc.indices_nonzero(mask)).to_pylist()
         return [(self._node_orig[r["source"]], self._node_orig[r["target"]])
@@ -404,7 +409,8 @@ class ArrowDiGraph:
 
     def _rebuild_nodes_table(self):
         cols = {"node": pa.array(self._node_order, type=pa.string())}
-        cols["node_type"] = pa.array(self._node_types, type=pa.string())
+        if any(t is not None for t in self._node_types):
+            cols["node_type"] = pa.array(self._node_types, type=pa.string())
         for name, vals in self._node_cols.items():
             cols[name] = _typed_column(list(vals))
         self._nodes_table = pa.table(cols)
@@ -413,8 +419,9 @@ class ArrowDiGraph:
         cols = {
             "source": pa.array([s for s, _ in self._edge_order], type=pa.string()),
             "target": pa.array([t for _, t in self._edge_order], type=pa.string()),
-            "edge_type": pa.array(self._edge_types, type=pa.string()),
         }
+        if any(t is not None for t in self._edge_types):
+            cols["edge_type"] = pa.array(self._edge_types, type=pa.string())
         for name, vals in self._edge_cols.items():
             cols[name] = _typed_column(list(vals))
         self._edges_table = pa.table(cols)
