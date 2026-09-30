@@ -363,6 +363,52 @@ def test_parquet_roundtrip_preserves_int_keys(tmp_path):
     assert restored.nodes_table().schema.field("node").type == pa.int64()
 
 
+def test_from_arrow_lazy_defers_index(typed_graph):
+    nodes, edges = typed_graph.nodes_table(), typed_graph.edges_table()
+    lazy = ArrowDiGraph.from_arrow(nodes, edges, index=False)
+    assert lazy._index_built is False
+    # table-level surface works without building the index ...
+    assert lazy.number_of_nodes() == 3
+    assert lazy.number_of_edges() == 3
+    assert lazy.nodes_table().equals(nodes)
+    assert lazy.edges_table().equals(edges)
+    assert lazy.out_degree_table().num_rows == 2
+    node_frames, edge_frames = lazy.partition_tables()
+    assert sorted(node_frames) == ["post", "user"]
+    assert sorted(edge_frames) == ["authored", "follows", "liked"]
+    assert lazy._index_built is False
+    # ... first Python-level touch builds it, with identical content
+    assert lazy.nodes == ["alice", "bob", "post1"]
+    assert lazy._index_built is True
+    assert lazy.nodes_table().equals(nodes)
+    assert lazy.node_attrs("alice") == typed_graph.node_attrs("alice")
+    assert lazy.edge_attrs("bob", "post1") == typed_graph.edge_attrs(
+        "bob", "post1"
+    )
+
+
+def test_lazy_graph_mutation_and_copy(typed_graph):
+    nodes, edges = typed_graph.nodes_table(), typed_graph.edges_table()
+    lazy = ArrowDiGraph.from_arrow(nodes, edges, index=False)
+    lazy.add_node("carol", node_type="user", age=41)
+    assert lazy._index_built is True
+    assert lazy.has_node("carol")
+    assert lazy.nodes_of_type("user") == ["alice", "bob", "carol"]
+    clone = ArrowDiGraph(lazy)
+    assert clone.nodes == lazy.nodes
+    assert clone.edges_table().equals(lazy.edges_table())
+
+
+def test_lazy_persist_roundtrip(tmp_path, typed_graph):
+    nodes, edges = typed_graph.nodes_table(), typed_graph.edges_table()
+    lazy = ArrowDiGraph.from_arrow(nodes, edges, index=False)
+    provider = ParquetStorageProvider(tmp_path / "store")
+    counts = persist(lazy, provider)
+    assert lazy._index_built is False
+    assert sum(counts.values()) == 6
+    _assert_graphs_equal(typed_graph, provider.load_graph())
+
+
 def test_backend_constructors():
     g = nx.Graph(backend="arrow")
     d = nx.DiGraph(backend="arrow")

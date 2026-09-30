@@ -124,8 +124,10 @@ class ArrowDiGraph:
         )
         self._nodes_dirty = False
         self._edges_dirty = False
+        self._index_built = True  # Python lookup indexes; see _ensure_index
         if isinstance(incoming_graph_data, ArrowDiGraph):
             other = incoming_graph_data
+            other._ensure_index()
             self._key_type = other._key_type
             self._node_order = list(other._node_order)
             self._node_pos = dict(other._node_pos)
@@ -257,8 +259,71 @@ class ArrowDiGraph:
             for u, v, t, a in edges
         ])
 
+    def _ensure_index(self):
+        """Build Python lookup indexes from the adopted tables, once.
+
+        Graphs created by :meth:`from_arrow` with ``index=False`` skip
+        index construction entirely: table-level methods work immediately
+        and anything touching nodes, edges or attributes builds the
+        indexes on first use. Mutation always materializes first, so the
+        tables and the indexes can never disagree.
+        """
+        if self._index_built:
+            return
+        nodes = self._nodes_table
+        if "node" in nodes.column_names:
+            node_type = nodes.schema.field("node").type
+            if _key_category(node_type) is None:
+                order = [
+                    k.decode() if isinstance(k, (bytes, bytearray)) else str(k)
+                    for k in nodes.column("node").to_pylist()
+                ]
+                self._key_type = pa.string()
+                self._nodes_dirty = True
+            else:
+                order = nodes.column("node").to_pylist()
+                self._key_type = node_type
+            self._node_order = order
+            self._node_pos = {k: i for i, k in enumerate(order)}
+            self._node_orig = dict(zip(order, order))
+            names = nodes.column_names
+            self._node_types = (
+                nodes.column("node_type").to_pylist()
+                if "node_type" in names else [None] * len(order)
+            )
+            self._node_cols = {
+                name: nodes.column(name).to_pylist()
+                for name in names if name not in ("node", "node_type")
+            }
+        edges = self._edges_table
+        if "source" in edges.column_names:
+            src = edges.column("source")
+            tgt = edges.column("target")
+            if src.type != self._key_type:
+                src = pc.cast(src, self._key_type)
+                self._edges_dirty = True
+            if tgt.type != self._key_type:
+                tgt = pc.cast(tgt, self._key_type)
+                self._edges_dirty = True
+            src = src.to_pylist()
+            tgt = tgt.to_pylist()
+            order = list(zip(src, tgt))
+            self._edge_order = order
+            self._edge_pos = {k: i for i, k in enumerate(order)}
+            names = edges.column_names
+            self._edge_types = (
+                edges.column("edge_type").to_pylist()
+                if "edge_type" in names else [None] * len(order)
+            )
+            self._edge_cols = {
+                name: edges.column(name).to_pylist()
+                for name in names if name not in ("source", "target", "edge_type")
+            }
+        self._index_built = True
+
     # -- nodes --
     def add_node(self, node, node_type=None, **attrs):
+        self._ensure_index()
         key = self._canonical_key(node)
         if key not in self._node_orig:
             self._node_orig[key] = node
@@ -276,14 +341,17 @@ class ArrowDiGraph:
         self._nodes_dirty = True
 
     def node_type(self, node):
+        self._ensure_index()
         return self._node_types[self._node_pos[self._lookup_key(node)]]
 
     @property
     def node_types(self):
+        self._ensure_index()
         return sorted({t for t in self._node_types if t is not None})
 
     def nodes_of_type(self, node_type):
         """Nodes of a given type, filtered in Arrow (no Python scan)."""
+        self._ensure_index()
         self._sync()
         if "node_type" not in self._nodes_table.column_names:
             return []
@@ -298,6 +366,7 @@ class ArrowDiGraph:
 
     def _add_nodes_batch(self, nodes):
         """Bulk node ingest: a few list-level passes, one table build."""
+        self._ensure_index()
         norm = []  # (orig, type, attrs)
         for n in nodes:
             if isinstance(n, tuple) and len(n) == 2 and isinstance(n[1], dict):
@@ -343,9 +412,11 @@ class ArrowDiGraph:
         self._nodes_dirty = True
 
     def has_node(self, node):
+        self._ensure_index()
         return self._lookup_key(node) in self._node_orig
 
     def remove_node(self, node):
+        self._ensure_index()
         key = self._lookup_key(node)
         if key not in self._node_orig:
             raise KeyError(node)
@@ -371,6 +442,7 @@ class ArrowDiGraph:
         self._edges_dirty = True
 
     def node_attrs(self, node):
+        self._ensure_index()
         key = self._lookup_key(node)
         idx = self._node_pos[key]
         d = {n: c[idx] for n, c in self._node_cols.items() if c[idx] is not None}
@@ -380,13 +452,17 @@ class ArrowDiGraph:
 
     @property
     def nodes(self):
+        self._ensure_index()
         return [self._node_orig[k] for k in self._node_order]
 
     def number_of_nodes(self):
-        return len(self._node_order)
+        # Table-level: works without materializing the index.
+        self._sync()
+        return self._nodes_table.num_rows
 
     # -- edges --
     def add_edge(self, u, v, edge_type=None, **attrs):
+        self._ensure_index()
         self.add_node(u)
         self.add_node(v)
         key = (self._canonical_key(u), self._canonical_key(v))
@@ -405,15 +481,18 @@ class ArrowDiGraph:
         self._edges_dirty = True
 
     def edge_type(self, u, v):
+        self._ensure_index()
         key = (self._lookup_key(u), self._lookup_key(v))
         return self._edge_types[self._edge_pos[key]]
 
     @property
     def edge_types(self):
+        self._ensure_index()
         return sorted({t for t in self._edge_types if t is not None})
 
     def edges_of_type(self, edge_type):
         """Edges of a given type, filtered in Arrow (no Python scan)."""
+        self._ensure_index()
         self._sync()
         if "edge_type" not in self._edges_table.column_names:
             return []
@@ -428,6 +507,7 @@ class ArrowDiGraph:
     def _add_edges_batch(self, ebunch):
         """Bulk edge ingest: endpoints ensured in one node batch, then
         edge keys/attrs merged in list-level passes, one table build."""
+        self._ensure_index()
         norm = []  # (u_orig, v_orig, type, attrs)
         for e in ebunch:
             if len(e) == 2:
@@ -467,9 +547,11 @@ class ArrowDiGraph:
         self._edges_dirty = True
 
     def has_edge(self, u, v):
+        self._ensure_index()
         return (self._lookup_key(u), self._lookup_key(v)) in self._edge_pos
 
     def remove_edge(self, u, v):
+        self._ensure_index()
         key = (self._lookup_key(u), self._lookup_key(v))
         if key not in self._edge_pos:
             raise KeyError((u, v))
@@ -483,6 +565,7 @@ class ArrowDiGraph:
         self._edges_dirty = True
 
     def edge_attrs(self, u, v):
+        self._ensure_index()
         idx = self._edge_pos[(self._lookup_key(u), self._lookup_key(v))]
         d = {n: c[idx] for n, c in self._edge_cols.items() if c[idx] is not None}
         if self._edge_types[idx] is not None:
@@ -490,19 +573,24 @@ class ArrowDiGraph:
         return d
 
     def successors(self, node):
+        self._ensure_index()
         key = self._lookup_key(node)
         return [self._node_orig[t] for (s, t) in self._edge_order if s == key]
 
     def predecessors(self, node):
+        self._ensure_index()
         key = self._lookup_key(node)
         return [self._node_orig[s] for (s, t) in self._edge_order if t == key]
 
     @property
     def edges(self):
+        self._ensure_index()
         return [(self._node_orig[s], self._node_orig[t]) for (s, t) in self._edge_order]
 
     def number_of_edges(self):
-        return len(self._edge_order)
+        # Table-level: works without materializing the index.
+        self._sync()
+        return self._edges_table.num_rows
 
     # -- arrow-native --
     def _sync(self):
@@ -551,43 +639,28 @@ class ArrowDiGraph:
         return cls(g)
 
     @classmethod
-    def from_arrow(cls, nodes=None, edges=None):
+    def from_arrow(cls, nodes=None, edges=None, *, index=True):
         """Bulk-adopt Arrow tables: no per-row Python loop.
 
-        The input tables become the backing tables directly; Python lookup
-        indexes are derived with vectorized ``to_pylist()`` calls. The key
-        column type is preserved (int, float, string, date, time,
-        timestamp); anything else falls back to string keys. Node objects
-        are the adopted keys themselves. Edge endpoint columns are cast to
-        the node key type when they differ."""
+        The input tables become the backing tables directly. With the
+        default ``index=True`` the Python lookup indexes are derived with
+        vectorized ``to_pylist()`` calls. With ``index=False`` even that
+        is deferred: only the key type is read from the schema, and the
+        indexes are built on first Python-level access. Table-level
+        methods (``nodes_table``, ``edges_table``, ``partition_tables``,
+        ``out_degree_table``, counts) work immediately without building
+        them. The key column type is preserved (int, float, string, date,
+        time, timestamp); anything else falls back to string keys on first
+        index build. Node objects are the adopted keys themselves. Edge
+        endpoint columns are cast to the node key type when they differ."""
         g = cls()
         if nodes is not None:
             node_type = nodes.schema.field("node").type
-            if _key_category(node_type) is None:
-                order = [
-                    k.decode() if isinstance(k, (bytes, bytearray)) else str(k)
-                    for k in nodes.column("node").to_pylist()
-                ]
-                g._key_type = pa.string()
-                rebuild_nodes = True
-            else:
-                order = nodes.column("node").to_pylist()
-                g._key_type = node_type
-                rebuild_nodes = False
-            g._node_order = order
-            g._node_pos = {k: i for i, k in enumerate(order)}
-            g._node_orig = dict(zip(order, order))
-            names = nodes.column_names
-            g._node_types = (
-                nodes.column("node_type").to_pylist()
-                if "node_type" in names else [None] * len(order)
+            g._key_type = (
+                node_type if _key_category(node_type) is not None else pa.string()
             )
-            g._node_cols = {
-                name: nodes.column(name).to_pylist()
-                for name in names if name not in ("node", "node_type")
-            }
             g._nodes_table = nodes
-            g._nodes_dirty = rebuild_nodes
+            g._index_built = False
         if edges is not None:
             if nodes is None:
                 endpoint_type = edges.schema.field("source").type
@@ -596,31 +669,10 @@ class ArrowDiGraph:
                     if _key_category(endpoint_type) is not None
                     else pa.string()
                 )
-            src = edges.column("source")
-            tgt = edges.column("target")
-            rebuild_edges = False
-            if src.type != g._key_type:
-                src = pc.cast(src, g._key_type)
-                rebuild_edges = True
-            if tgt.type != g._key_type:
-                tgt = pc.cast(tgt, g._key_type)
-                rebuild_edges = True
-            src = src.to_pylist()
-            tgt = tgt.to_pylist()
-            order = list(zip(src, tgt))
-            g._edge_order = order
-            g._edge_pos = {k: i for i, k in enumerate(order)}
-            names = edges.column_names
-            g._edge_types = (
-                edges.column("edge_type").to_pylist()
-                if "edge_type" in names else [None] * len(order)
-            )
-            g._edge_cols = {
-                name: edges.column(name).to_pylist()
-                for name in names if name not in ("source", "target", "edge_type")
-            }
             g._edges_table = edges
-            g._edges_dirty = rebuild_edges
+            g._index_built = False
+        if index:
+            g._ensure_index()
         return g
 
     def out_degree_table(self):
@@ -641,6 +693,7 @@ class ArrowDiGraph:
     def to_networkx(self):
         import networkx as nx
 
+        self._ensure_index()
         g = nx.DiGraph()
         g.graph.update(self.graph)
         for k in self._node_order:
