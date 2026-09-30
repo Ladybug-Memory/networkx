@@ -1,7 +1,8 @@
 """Directed graph backed by ``pyarrow.Table`` for nodes and edges.
 
-Nodes: ``node`` key column + one typed column per homogeneous attribute.
-Edges: ``source``/``target`` key columns + one typed column per attribute.
+Nodes: ``node`` key column + reserved ``node_type`` column + one typed
+column per homogeneous attribute. Edges: ``source``/``target`` key
+columns + reserved ``edge_type`` column + one typed column per attribute.
 Missing values are null. Columns are (dictionary-)encoded by Arrow, so
 large homogeneous attrs use far less memory than per-object Python dicts.
 """
@@ -31,9 +32,11 @@ class ArrowDiGraph:
         self._node_pos = {}  # key -> index (O(1) lookup)
         self._node_orig = {}  # key -> original object
         self._node_cols = {}  # attr name -> list aligned with _node_order
+        self._node_types = []  # reserved node_type column, aligned with _node_order
         self._edge_order = []  # (skey, tkey) tuples
         self._edge_pos = {}  # edge key -> index
         self._edge_cols = {}
+        self._edge_types = []  # reserved edge_type column, aligned with _edge_order
         self._nodes_table = pa.table({"node": pa.array([], type=pa.string())})
         self._edges_table = pa.table(
             {"source": pa.array([], type=pa.string()),
@@ -47,9 +50,11 @@ class ArrowDiGraph:
             self._node_pos = dict(other._node_pos)
             self._node_orig = dict(other._node_orig)
             self._node_cols = {k: list(v) for k, v in other._node_cols.items()}
+            self._node_types = list(other._node_types)
             self._edge_order = list(other._edge_order)
             self._edge_pos = dict(other._edge_pos)
             self._edge_cols = {k: list(v) for k, v in other._edge_cols.items()}
+            self._edge_types = list(other._edge_types)
             self.graph.update(other.graph)
             self._nodes_dirty = self._edges_dirty = True
         elif incoming_graph_data is not None:
@@ -68,19 +73,38 @@ class ArrowDiGraph:
                 self.graph.update(incoming_graph_data.graph)
 
     # -- nodes --
-    def add_node(self, node, **attrs):
+    def add_node(self, node, node_type=None, **attrs):
         key = str(node)
         if key not in self._node_orig:
             self._node_orig[key] = node
             self._node_pos[key] = len(self._node_order)
             self._node_order.append(key)
+            self._node_types.append(None)
             for name in self._node_cols:
                 self._node_cols[name].append(None)
         idx = self._node_pos[key]
+        if node_type is not None:
+            self._node_types[idx] = node_type
         for name, val in attrs.items():
             self._node_cols.setdefault(name, [None] * len(self._node_order))
             self._node_cols[name][idx] = val
         self._nodes_dirty = True
+
+    def node_type(self, node):
+        return self._node_types[self._node_pos[str(node)]]
+
+    @property
+    def node_types(self):
+        return sorted({t for t in self._node_types if t is not None})
+
+    def nodes_of_type(self, node_type):
+        """Nodes of a given type, filtered in Arrow (no Python scan)."""
+        self._sync()
+        mask = pc.equal(self._nodes_table.column("node_type"), node_type)
+        keys = pc.take(
+            self._nodes_table.column("node"), pc.indices_nonzero(mask)
+        ).to_pylist()
+        return [self._node_orig[k] for k in keys]
 
     def add_nodes_from(self, nodes):
         for n in nodes:
@@ -99,6 +123,7 @@ class ArrowDiGraph:
         idx = self._node_pos.pop(key)
         del self._node_order[idx]
         del self._node_orig[key]
+        del self._node_types[idx]
         for name in self._node_cols:
             del self._node_cols[name][idx]
         for i in range(idx, len(self._node_order)):
@@ -109,6 +134,7 @@ class ArrowDiGraph:
             idxs = [i for i, e in enumerate(self._edge_order) if e in drop]
             for i in sorted(idxs, reverse=True):
                 del self._edge_order[i]
+                del self._edge_types[i]
                 for name in self._edge_cols:
                     del self._edge_cols[name][i]
             self._edge_pos = {e: i for i, e in enumerate(self._edge_order)}
@@ -118,7 +144,10 @@ class ArrowDiGraph:
     def node_attrs(self, node):
         key = str(node)
         idx = self._node_pos[key]
-        return {n: c[idx] for n, c in self._node_cols.items() if c[idx] is not None}
+        d = {n: c[idx] for n, c in self._node_cols.items() if c[idx] is not None}
+        if self._node_types[idx] is not None:
+            d["node_type"] = self._node_types[idx]
+        return d
 
     @property
     def nodes(self):
@@ -128,20 +157,38 @@ class ArrowDiGraph:
         return len(self._node_order)
 
     # -- edges --
-    def add_edge(self, u, v, **attrs):
+    def add_edge(self, u, v, edge_type=None, **attrs):
         self.add_node(u)
         self.add_node(v)
         key = (str(u), str(v))
         if key not in self._edge_pos:
             self._edge_pos[key] = len(self._edge_order)
             self._edge_order.append(key)
+            self._edge_types.append(None)
             for name in self._edge_cols:
                 self._edge_cols[name].append(None)
         idx = self._edge_pos[key]
+        if edge_type is not None:
+            self._edge_types[idx] = edge_type
         for name, val in attrs.items():
             self._edge_cols.setdefault(name, [None] * len(self._edge_order))
             self._edge_cols[name][idx] = val
         self._edges_dirty = True
+
+    def edge_type(self, u, v):
+        return self._edge_types[self._edge_pos[(str(u), str(v))]]
+
+    @property
+    def edge_types(self):
+        return sorted({t for t in self._edge_types if t is not None})
+
+    def edges_of_type(self, edge_type):
+        """Edges of a given type, filtered in Arrow (no Python scan)."""
+        self._sync()
+        mask = pc.equal(self._edges_table.column("edge_type"), edge_type)
+        rows = pc.take(self._edges_table, pc.indices_nonzero(mask)).to_pylist()
+        return [(self._node_orig[r["source"]], self._node_orig[r["target"]])
+                for r in rows]
 
     def add_edges_from(self, ebunch):
         for e in ebunch:
@@ -159,6 +206,7 @@ class ArrowDiGraph:
             raise KeyError((u, v))
         idx = self._edge_pos.pop(key)
         del self._edge_order[idx]
+        del self._edge_types[idx]
         for name in self._edge_cols:
             del self._edge_cols[name][idx]
         for i in range(idx, len(self._edge_order)):
@@ -167,7 +215,10 @@ class ArrowDiGraph:
 
     def edge_attrs(self, u, v):
         idx = self._edge_pos[(str(u), str(v))]
-        return {n: c[idx] for n, c in self._edge_cols.items() if c[idx] is not None}
+        d = {n: c[idx] for n, c in self._edge_cols.items() if c[idx] is not None}
+        if self._edge_types[idx] is not None:
+            d["edge_type"] = self._edge_types[idx]
+        return d
 
     def successors(self, node):
         key = str(node)
@@ -247,20 +298,19 @@ class ArrowDiGraph:
 
         g = nx.DiGraph()
         g.graph.update(self.graph)
-        for i, k in enumerate(self._node_order):
-            g.add_node(
-                self._node_orig[k],
-                **{n: c[i] for n, c in self._node_cols.items() if c[i] is not None},
-            )
-        for i, (s, t) in enumerate(self._edge_order):
+        for k in self._node_order:
+            g.add_node(self._node_orig[k], **self.node_attrs(self._node_orig[k]))
+        for s, t in self._edge_order:
             g.add_edge(
-                self._node_orig[s], self._node_orig[t],
-                **{n: c[i] for n, c in self._edge_cols.items() if c[i] is not None},
+                self._node_orig[s],
+                self._node_orig[t],
+                **self.edge_attrs(self._node_orig[s], self._node_orig[t]),
             )
         return g
 
     def _rebuild_nodes_table(self):
         cols = {"node": pa.array(self._node_order, type=pa.string())}
+        cols["node_type"] = pa.array(self._node_types, type=pa.string())
         for name, vals in self._node_cols.items():
             cols[name] = _typed_column(list(vals))
         self._nodes_table = pa.table(cols)
@@ -269,6 +319,7 @@ class ArrowDiGraph:
         cols = {
             "source": pa.array([s for s, _ in self._edge_order], type=pa.string()),
             "target": pa.array([t for _, t in self._edge_order], type=pa.string()),
+            "edge_type": pa.array(self._edge_types, type=pa.string()),
         }
         for name, vals in self._edge_cols.items():
             cols[name] = _typed_column(list(vals))
