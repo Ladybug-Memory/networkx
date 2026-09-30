@@ -24,15 +24,19 @@ class ArrowDiGraph:
 
     def __init__(self, incoming_graph_data=None):
         self._node_order = []  # string keys, insertion order
+        self._node_pos = {}  # key -> index (O(1) lookup)
         self._node_orig = {}  # key -> original object
         self._node_cols = {}  # attr name -> list aligned with _node_order
         self._edge_order = []  # (skey, tkey) tuples
+        self._edge_pos = {}  # edge key -> index
         self._edge_cols = {}
         self._nodes_table = pa.table({"node": pa.array([], type=pa.string())})
         self._edges_table = pa.table(
             {"source": pa.array([], type=pa.string()),
              "target": pa.array([], type=pa.string())}
         )
+        self._nodes_dirty = False
+        self._edges_dirty = False
         if incoming_graph_data is not None:
             for n, d in incoming_graph_data.nodes(data=True):
                 self.add_node(n, **d)
@@ -44,14 +48,15 @@ class ArrowDiGraph:
         key = str(node)
         if key not in self._node_orig:
             self._node_orig[key] = node
+            self._node_pos[key] = len(self._node_order)
             self._node_order.append(key)
             for name in self._node_cols:
                 self._node_cols[name].append(None)
-        idx = self._node_order.index(key)
+        idx = self._node_pos[key]
         for name, val in attrs.items():
             self._node_cols.setdefault(name, [None] * len(self._node_order))
             self._node_cols[name][idx] = val
-        self._rebuild_nodes_table()
+        self._nodes_dirty = True
 
     def add_nodes_from(self, nodes):
         for n in nodes:
@@ -67,11 +72,13 @@ class ArrowDiGraph:
         key = str(node)
         if key not in self._node_orig:
             raise KeyError(node)
-        idx = self._node_order.index(key)
+        idx = self._node_pos.pop(key)
         del self._node_order[idx]
         del self._node_orig[key]
         for name in self._node_cols:
             del self._node_cols[name][idx]
+        for i in range(idx, len(self._node_order)):
+            self._node_pos[self._node_order[i]] = i
         keep = [(s, t) for (s, t) in self._edge_order if s != key and t != key]
         drop = set(self._edge_order) - set(keep)
         if drop:
@@ -80,12 +87,13 @@ class ArrowDiGraph:
                 del self._edge_order[i]
                 for name in self._edge_cols:
                     del self._edge_cols[name][i]
-        self._rebuild_nodes_table()
-        self._rebuild_edges_table()
+            self._edge_pos = {e: i for i, e in enumerate(self._edge_order)}
+        self._nodes_dirty = True
+        self._edges_dirty = True
 
     def node_attrs(self, node):
         key = str(node)
-        idx = self._node_order.index(key)
+        idx = self._node_pos[key]
         return {n: c[idx] for n, c in self._node_cols.items() if c[idx] is not None}
 
     @property
@@ -100,15 +108,16 @@ class ArrowDiGraph:
         self.add_node(u)
         self.add_node(v)
         key = (str(u), str(v))
-        if key not in self._edge_order:
+        if key not in self._edge_pos:
+            self._edge_pos[key] = len(self._edge_order)
             self._edge_order.append(key)
             for name in self._edge_cols:
                 self._edge_cols[name].append(None)
-        idx = self._edge_order.index(key)
+        idx = self._edge_pos[key]
         for name, val in attrs.items():
             self._edge_cols.setdefault(name, [None] * len(self._edge_order))
             self._edge_cols[name][idx] = val
-        self._rebuild_edges_table()
+        self._edges_dirty = True
 
     def add_edges_from(self, ebunch):
         for e in ebunch:
@@ -118,20 +127,22 @@ class ArrowDiGraph:
                 self.add_edge(e[0], e[1], **e[2])
 
     def has_edge(self, u, v):
-        return (str(u), str(v)) in self._edge_order
+        return (str(u), str(v)) in self._edge_pos
 
     def remove_edge(self, u, v):
         key = (str(u), str(v))
-        if key not in self._edge_order:
+        if key not in self._edge_pos:
             raise KeyError((u, v))
-        idx = self._edge_order.index(key)
+        idx = self._edge_pos.pop(key)
         del self._edge_order[idx]
         for name in self._edge_cols:
             del self._edge_cols[name][idx]
-        self._rebuild_edges_table()
+        for i in range(idx, len(self._edge_order)):
+            self._edge_pos[self._edge_order[i]] = i
+        self._edges_dirty = True
 
     def edge_attrs(self, u, v):
-        idx = self._edge_order.index((str(u), str(v)))
+        idx = self._edge_pos[(str(u), str(v))]
         return {n: c[idx] for n, c in self._edge_cols.items() if c[idx] is not None}
 
     def successors(self, node):
@@ -150,11 +161,34 @@ class ArrowDiGraph:
         return len(self._edge_order)
 
     # -- arrow-native --
+    def _sync(self):
+        if self._nodes_dirty:
+            self._rebuild_nodes_table()
+            self._nodes_dirty = False
+        if self._edges_dirty:
+            self._rebuild_edges_table()
+            self._edges_dirty = False
+
     def nodes_table(self):
+        self._sync()
         return self._nodes_table
 
     def edges_table(self):
+        self._sync()
         return self._edges_table
+
+    def as_writeable(self):
+        """Fall back to a dict-backed ``DiGraph`` for write-heavy work.
+
+        Use when doing many incremental adds/removes (O(1) per edit vs
+        O(n) table rebuilds here). Convert back with ``from_networkx``.
+        """
+        return self.to_networkx()
+
+    @classmethod
+    def from_networkx(cls, g):
+        """Bulk-load from a dict-backed graph (the write-heavy fallback)."""
+        return cls(g)
 
     @classmethod
     def from_arrow(cls, nodes=None, edges=None):
@@ -170,6 +204,7 @@ class ArrowDiGraph:
         return g
 
     def out_degree_table(self):
+        self._sync()
         if self._edges_table.num_rows == 0:
             return pa.table(
                 {"node": pa.array([], type=pa.string()),
