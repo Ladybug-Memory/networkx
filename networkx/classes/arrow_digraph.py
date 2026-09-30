@@ -1,10 +1,10 @@
-"""Directed graph backed by a ``pyarrow.Table`` for edge storage.
+"""Directed graph backed by ``pyarrow.Table`` for node and edge storage.
 
-Edges are stored in a table with ``source`` and ``target`` columns.
-Node attributes and edge attributes are kept in Python dicts keyed by
-node / edge key so the class stays small while still offering table-native
-access via :meth:`edges_table` for zero-copy analytics (filter, group-by,
-join) with the Arrow compute API.
+Nodes live in a single-column table (``node``) and edges in a
+``source``/``target`` table. Attribute dicts are kept alongside for O(1)
+Python-level lookup; the tables are the source of truth for membership
+and give columnar memory layout plus zero-copy analytics (filter,
+group-by, join) via the Arrow compute API.
 """
 
 import pyarrow as pa
@@ -19,6 +19,9 @@ class ArrowDiGraph:
     def __init__(self, incoming_graph_data=None):
         self._node_attrs = {}
         self._edge_attrs = {}  # (u, v) -> dict
+        self._nodes_table = pa.table(
+            {"node": pa.array([], type=pa.string())}
+        )
         self._edges_table = pa.table(
             {"source": pa.array([], type=pa.string()),
              "target": pa.array([], type=pa.string())}
@@ -31,8 +34,12 @@ class ArrowDiGraph:
     # -- nodes --
     def add_node(self, node, **attrs):
         key = str(node)
-        if key not in self._node_attrs:
+        is_new = key not in self._node_attrs
+        if is_new:
             self._node_attrs[key] = {"_orig": node}
+            self._nodes_table = pa.concat_tables(
+                [self._nodes_table, pa.table({"node": [key]})]
+            )
         self._node_attrs[key].update(attrs)
 
     def add_nodes_from(self, nodes):
@@ -53,6 +60,7 @@ class ArrowDiGraph:
         kill = [(u, v) for (u, v) in self._edge_attrs if u == key or v == key]
         for e in kill:
             del self._edge_attrs[e]
+        self._rebuild_nodes_table()
         self._rebuild_table()
 
     @property
@@ -117,6 +125,10 @@ class ArrowDiGraph:
         return len(self._edge_attrs)
 
     # -- arrow-native --
+    def nodes_table(self):
+        """Return the underlying ``pyarrow.Table`` of nodes."""
+        return self._nodes_table
+
     def edges_table(self):
         """Return the underlying ``pyarrow.Table`` of edges."""
         return self._edges_table
@@ -154,6 +166,10 @@ class ArrowDiGraph:
         for (s, t), attrs in self._edge_attrs.items():
             g.add_edge(self._node_attrs[s]["_orig"], self._node_attrs[t]["_orig"], **attrs)
         return g
+
+    def _rebuild_nodes_table(self):
+        keys = list(self._node_attrs)
+        self._nodes_table = pa.table({"node": pa.array(keys, type=pa.string())})
 
     def _rebuild_table(self):
         if not self._edge_attrs:
