@@ -24,7 +24,9 @@ class ArrowDiGraph:
 
     __networkx_backend__ = "arrow"
 
-    def __init__(self, incoming_graph_data=None):
+    def __init__(self, incoming_graph_data=None, **attr):
+        attr.pop("backend", None)  # consumed by dispatch machinery
+        self.graph = dict(attr)  # graph-level attributes, like nx.Graph.graph
         self._node_order = []  # string keys, insertion order
         self._node_pos = {}  # key -> index (O(1) lookup)
         self._node_orig = {}  # key -> original object
@@ -39,11 +41,31 @@ class ArrowDiGraph:
         )
         self._nodes_dirty = False
         self._edges_dirty = False
-        if incoming_graph_data is not None:
+        if isinstance(incoming_graph_data, ArrowDiGraph):
+            other = incoming_graph_data
+            self._node_order = list(other._node_order)
+            self._node_pos = dict(other._node_pos)
+            self._node_orig = dict(other._node_orig)
+            self._node_cols = {k: list(v) for k, v in other._node_cols.items()}
+            self._edge_order = list(other._edge_order)
+            self._edge_pos = dict(other._edge_pos)
+            self._edge_cols = {k: list(v) for k, v in other._edge_cols.items()}
+            self.graph.update(other.graph)
+            self._nodes_dirty = self._edges_dirty = True
+        elif incoming_graph_data is not None:
+            if not hasattr(incoming_graph_data, "nodes"):
+                # edgelists, dicts, generators...: use the standard conversion
+                import networkx as nx
+
+                incoming_graph_data = nx.convert.to_networkx_graph(
+                    incoming_graph_data, create_using=nx.DiGraph
+                )
             for n, d in incoming_graph_data.nodes(data=True):
                 self.add_node(n, **d)
             for u, v, d in incoming_graph_data.edges(data=True):
                 self.add_edge(u, v, **d)
+            if hasattr(incoming_graph_data, "graph"):
+                self.graph.update(incoming_graph_data.graph)
 
     # -- nodes --
     def add_node(self, node, **attrs):
@@ -224,6 +246,7 @@ class ArrowDiGraph:
         import networkx as nx
 
         g = nx.DiGraph()
+        g.graph.update(self.graph)
         for i, k in enumerate(self._node_order):
             g.add_node(
                 self._node_orig[k],

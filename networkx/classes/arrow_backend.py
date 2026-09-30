@@ -75,14 +75,30 @@ class ArrowBackendInterface:
 
     @staticmethod
     def should_run(name, args, kwargs):
-        # Only volunteer for algorithms with native Arrow implementations;
-        # everything else stays on the NetworkX path unless the user opts
-        # into backend priority + fallback.
+        # Only volunteer for algorithms with native Arrow implementations
+        # (plus graph construction); everything else stays on the NetworkX
+        # path unless the user opts into backend priority + fallback.
         return name in {
+            "graph__new__",
+            "digraph__new__",
             "in_degree_centrality",
             "out_degree_centrality",
             "topological_sort",
         }
+
+    # -- graph construction: nx.Graph(backend="arrow") / nx.DiGraph(...) --
+    # NOTE: ArrowDiGraph is directed; nx.Graph(backend="arrow") returns it
+    # as-is (directed semantics). There is no undirected Arrow class yet.
+
+    @staticmethod
+    def graph__new__(cls, incoming_graph_data=None, **attr):
+        attr.pop("backend", None)  # consumed by dispatch machinery
+        return ArrowDiGraph(incoming_graph_data, **attr)
+
+    @staticmethod
+    def digraph__new__(cls, incoming_graph_data=None, **attr):
+        attr.pop("backend", None)  # consumed by dispatch machinery
+        return ArrowDiGraph(incoming_graph_data, **attr)
 
     # -- native Arrow implementations (signatures mirror the nx originals) --
 
