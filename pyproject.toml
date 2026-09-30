@@ -54,6 +54,7 @@ Documentation = 'https://networkx.org/documentation/stable/'
 
 [project.entry-points."networkx.backends"]
 nx_loopback = 'networkx.classes.tests.dispatch_interface:backend_interface'
+arrow = 'networkx.classes.arrow_backend:backend_interface'
 
 [project.optional-dependencies]
 benchmarking = [

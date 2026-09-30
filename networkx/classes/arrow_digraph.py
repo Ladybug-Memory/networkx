@@ -22,6 +22,8 @@ def _typed_column(values):
 class ArrowDiGraph:
     """Minimal directed graph with nodes/edges + attrs in Arrow tables."""
 
+    __networkx_backend__ = "arrow"
+
     def __init__(self, incoming_graph_data=None):
         self._node_order = []  # string keys, insertion order
         self._node_pos = {}  # key -> index (O(1) lookup)
@@ -248,6 +250,12 @@ class ArrowDiGraph:
         for name, vals in self._edge_cols.items():
             cols[name] = _typed_column(list(vals))
         self._edges_table = pa.table(cols)
+
+    def is_directed(self):
+        return True
+
+    def is_multigraph(self):
+        return False
 
     def __len__(self):
         return self.number_of_nodes()
