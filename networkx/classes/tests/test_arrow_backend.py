@@ -1,3 +1,5 @@
+import datetime
+
 import pytest
 
 pa = pytest.importorskip("pyarrow")
@@ -249,6 +251,116 @@ def test_parquet_provider_repersist_drops_stale_files(tmp_path, typed_graph):
     persist(typed_graph, provider)
     assert len(list((tmp_path / "store" / "edges").glob("*.parquet"))) == 1
     _assert_graphs_equal(typed_graph, provider.load_graph())
+
+
+def test_native_key_types():
+    cases = [
+        ([0, 1, 2], pa.int64()),
+        ([0.5, 1.5, 2.5], pa.float64()),
+        (["a", "b", "c"], pa.string()),
+        (
+            [
+                datetime.date(2024, 1, 1),
+                datetime.date(2024, 1, 2),
+                datetime.date(2024, 1, 3),
+            ],
+            pa.date32(),
+        ),
+        (
+            [datetime.time(1, 2), datetime.time(3, 4), datetime.time(5, 6)],
+            pa.time64("us"),
+        ),
+        (
+            [
+                datetime.datetime(2024, 1, 1, 1, 2),
+                datetime.datetime(2024, 1, 2),
+                datetime.datetime(2024, 1, 3, 4, 5),
+            ],
+            pa.timestamp("us"),
+        ),
+    ]
+    for keys, expected_type in cases:
+        g = ArrowDiGraph()
+        g.add_edge(keys[0], keys[1])
+        g.add_edge(keys[1], keys[2])
+        assert g.nodes_table().schema.field("node").type == expected_type
+        assert g.edges_table().schema.field("source").type == expected_type
+        assert g.nodes == keys
+        assert g.has_node(keys[2])
+        assert g.successors(keys[0]) == [keys[1]]
+        assert g.has_edge(keys[1], keys[2])
+
+
+def test_bool_keys_normalize_to_int():
+    g = ArrowDiGraph()
+    g.add_edge(True, False)
+    assert g.nodes_table().schema.field("node").type == pa.int64()
+    assert g.has_node(True) and g.has_node(1)  # NetworkX True == 1 semantics
+    assert g.has_edge(True, False)
+
+
+def test_explicit_key_type():
+    g = ArrowDiGraph(key_type=pa.float32())
+    g.add_edge(0.5, 1.5)
+    assert g.nodes_table().schema.field("node").type == pa.float32()
+    assert g.has_edge(0.5, 1.5)
+    with pytest.raises(TypeError):
+        ArrowDiGraph(key_type=pa.binary())
+
+
+def test_mixed_keys_widen_or_fallback_to_string():
+    g = ArrowDiGraph()
+    g.add_node(1)
+    g.add_edge(1, 2)
+    g.add_edge(2.5, 3)  # int widens to float, preserving nodes
+    assert g.nodes_table().schema.field("node").type == pa.float64()
+    assert g.has_node(2) and g.has_node(2.0)
+    assert g.nodes == [1, 2, 2.5, 3]
+
+    g = ArrowDiGraph()
+    g.add_node(1)
+    g.add_node("1")  # old merge semantics: 1 and "1" collide
+    assert g.nodes_table().schema.field("node").type == pa.string()
+    assert g.number_of_nodes() == 1
+
+
+def test_from_arrow_preserves_key_types():
+    keys = {
+        pa.int32(): [0, 1],
+        pa.float32(): [0.5, 1.5],
+        pa.date64(): [datetime.date(2024, 1, 1), datetime.date(2024, 1, 2)],
+        pa.string(): ["a", "b"],
+    }
+    for arrow_type, values in keys.items():
+        nodes = pa.table({"node": pa.array(values, type=arrow_type)})
+        edges = pa.table(
+            {
+                "source": pa.array(values[:1], type=arrow_type),
+                "target": pa.array(values[1:], type=arrow_type),
+            }
+        )
+        g = ArrowDiGraph.from_arrow(nodes, edges)
+        assert g.nodes_table().schema.field("node").type == arrow_type
+        assert g.has_edge(values[0], values[1])
+        assert g.nodes == values
+    # binary key columns (no native key kind) decode to utf-8 strings
+    nodes = pa.table({"node": pa.array([b"a", b"b"])})
+    g = ArrowDiGraph.from_arrow(nodes, None)
+    assert g.nodes_table().schema.field("node").type == pa.string()
+    assert g.nodes == ["a", "b"]
+
+
+def test_parquet_roundtrip_preserves_int_keys(tmp_path):
+    g = ArrowDiGraph()
+    g.add_edge(0, 1, weight=2.5)
+    g.add_edge(1, 2)
+    provider = ParquetStorageProvider(tmp_path / "store")
+    persist(g, provider)
+    restored = provider.load_graph()
+    assert restored.nodes == [0, 1, 2]
+    assert restored.edges == [(0, 1), (1, 2)]
+    assert restored.edge_attrs(0, 1) == {"weight": 2.5}
+    assert restored.nodes_table().schema.field("node").type == pa.int64()
 
 
 def test_backend_constructors():

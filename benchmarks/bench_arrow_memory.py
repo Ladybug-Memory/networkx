@@ -69,15 +69,17 @@ def build_pair(n, seed=0):
     }
 
 
-def bench_writes(g_arrow, g_dict, n_ops=2000):
-    # Incremental single-edge writes: dict fallback should win (O(1) vs rebuild).
+def bench_writes(g_arrow, g_dict, n, n_ops=2000):
+    # Incremental single-edge writes with type-consistent int keys, so the
+    # Arrow graph stays on its fast path (no key-type migration).
+    base = 10 * n
     t0 = time.perf_counter()
     for i in range(n_ops):
-        g_arrow.add_edge(f"w{i}", f"w{i+1}", weight=1.0)
+        g_arrow.add_edge(base + i, base + i + 1, weight=1.0)
     t_arrow = time.perf_counter() - t0
     t0 = time.perf_counter()
     for i in range(n_ops):
-        g_dict.add_edge(f"w{i}", f"w{i+1}", weight=1.0)
+        g_dict.add_edge(base + i, base + i + 1, weight=1.0)
     t_dict = time.perf_counter() - t0
     return t_arrow, t_dict
 
@@ -99,7 +101,7 @@ def main():
     print(f"bulk build time: arrow {m['build_arrow_s']:.2f}s vs dict {m['build_dict_s']:.2f}s")
     print(f"bulk load ArrowDiGraph(nx_graph): {m['bulk_arrow_s']:.2f}s "
           f"({m['build_arrow_s'] / max(m['bulk_arrow_s'], 1e-9):.1f}x faster than incremental)")
-    tw_arrow, tw_dict = bench_writes(a, d)
+    tw_arrow, tw_dict = bench_writes(a, d, args.n)
     print(f"single-edge writes (2000): arrow {tw_arrow:.3f}s vs dict {tw_dict:.3f}s")
     if tw_arrow > tw_dict:
         print("-> write-heavy? fall back: g_dict = g_arrow.as_writeable(); "

@@ -210,11 +210,9 @@ class ArrowBackendInterface:
         grouped = t.group_by(col).aggregate([(col, "count")])
         keys = grouped.column(col).to_pylist()
         vals = grouped.column(f"{col}_count").to_pylist()
-        # map string keys back to original node objects
-        rev = {str(v): v for v in nodes}
         for k, c in zip(keys, vals):
-            if k in rev:
-                centrality[rev[k]] = c * scale
+            if k in G._node_orig:
+                centrality[G._node_orig[k]] = c * scale
         return centrality
 
     @staticmethod
@@ -223,9 +221,8 @@ class ArrowBackendInterface:
         nodes = G.nodes
         succ = {v: [] for v in nodes}
         indeg = dict.fromkeys(nodes, 0)
-        rev = {str(v): v for v in nodes}
         for row in G.edges_table().to_pylist():
-            u, v = rev[row["source"]], rev[row["target"]]
+            u, v = G._node_orig[row["source"]], G._node_orig[row["target"]]
             succ[u].append(v)
             indeg[v] += 1
         zero = sorted(

@@ -23,11 +23,11 @@ edge tables (unifying heterogeneous attribute columns with nulls) and
 rebuilds an ``ArrowDiGraph`` via :meth:`ArrowDiGraph.from_arrow`, so the
 restored graph compares equal to the persisted one at the table level.
 
-Two fidelity notes. First, node identity in Parquet is the string key, so
-non-string originals (e.g. ``int`` nodes) come back as strings -- the same
-caveat as :meth:`ArrowDiGraph.from_arrow`. Second, ``graph_attrs`` must be
-JSON-serializable; it is forwarded through :func:`persist` keyword
-arguments, which providers receive untouched.
+Two fidelity notes. First, key columns keep their Arrow types, so integer,
+float, date, time and boolean keys round-trip natively; anything else
+stringifies on adopt (see :meth:`ArrowDiGraph.from_arrow`). Second,
+``graph_attrs`` must be JSON-serializable; it is forwarded through
+:func:`persist` keyword arguments, which providers receive untouched.
 """
 
 import json

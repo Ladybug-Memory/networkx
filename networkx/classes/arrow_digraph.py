@@ -2,11 +2,20 @@
 
 Nodes: ``node`` key column + one typed column per homogeneous attribute.
 Edges: ``source``/``target`` key columns + one typed column per attribute.
-Reserved ``node_type``/``edge_type`` columns are materialized only when at
+Key columns keep native Arrow types: integers use ``int64``, floats use
+``float64``, booleans normalize to integers (matching NetworkX ``True ==
+1`` node semantics), strings use ``string``, dates use ``date32``, times
+use ``time64[us]`` and datetimes use ``timestamp[us]``. An explicit
+``key_type`` (e.g. ``pa.float32()``) selects the precision up front. The
+first incompatible key migrates the graph: numeric keys widen along the
+``int -> float`` tower, anything else falls back to ``string`` while
+preserving the old merge semantics. Reserved ``node_type``/``edge_type`` columns are materialized only when at
 least one node/edge actually has a type, so single-type (or untyped)
 graphs pay nothing for the feature. Missing values are null. Columns are (dictionary-)encoded by Arrow, so
 large homogeneous attrs use far less memory than per-object Python dicts.
 """
+
+import datetime
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -19,6 +28,54 @@ def _typed_column(values):
         return pa.array(values)
     except Exception:
         return pa.array([None if v is None else str(v) for v in values])
+
+
+_key_category_cache = {}
+
+
+def _key_category(dtype):
+    """Map an Arrow type to a key category, or None if unsupported."""
+    if dtype is None:
+        return None
+    try:
+        return _key_category_cache[dtype]
+    except KeyError:
+        pass
+    if pa.types.is_boolean(dtype) or pa.types.is_integer(dtype):
+        category = "int"
+    elif pa.types.is_floating(dtype):
+        category = "float"
+    elif pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
+        category = "str"
+    elif pa.types.is_date(dtype):
+        category = "date"
+    elif pa.types.is_time(dtype):
+        category = "time"
+    elif pa.types.is_timestamp(dtype):
+        category = "timestamp"
+    else:
+        category = None
+    _key_category_cache[dtype] = category
+    return category
+
+
+def _key_type_for(node):
+    """Infer the Arrow key type for the first node of an empty graph."""
+    if isinstance(node, bool):
+        return pa.int64()
+    if isinstance(node, int):
+        return pa.int64()
+    if isinstance(node, float):
+        return pa.float64()
+    if isinstance(node, str):
+        return pa.string()
+    if isinstance(node, datetime.datetime):
+        return pa.timestamp("us")
+    if isinstance(node, datetime.date):
+        return pa.date32()
+    if isinstance(node, datetime.time):
+        return pa.time64("us")
+    return None
 
 
 def _partition_by_type(table, column):
@@ -45,10 +102,13 @@ class ArrowDiGraph:
 
     __networkx_backend__ = "arrow"
 
-    def __init__(self, incoming_graph_data=None, **attr):
+    def __init__(self, incoming_graph_data=None, key_type=None, **attr):
         attr.pop("backend", None)  # consumed by dispatch machinery
+        if key_type is not None and _key_category(key_type) is None:
+            raise TypeError(f"unsupported Arrow key type: {key_type!r}")
         self.graph = dict(attr)  # graph-level attributes, like nx.Graph.graph
-        self._node_order = []  # string keys, insertion order
+        self._key_type = key_type  # Arrow type of key columns, or None if empty
+        self._node_order = []  # canonical keys, insertion order
         self._node_pos = {}  # key -> index (O(1) lookup)
         self._node_orig = {}  # key -> original object
         self._node_cols = {}  # attr name -> list aligned with _node_order
@@ -66,6 +126,7 @@ class ArrowDiGraph:
         self._edges_dirty = False
         if isinstance(incoming_graph_data, ArrowDiGraph):
             other = incoming_graph_data
+            self._key_type = other._key_type
             self._node_order = list(other._node_order)
             self._node_pos = dict(other._node_pos)
             self._node_orig = dict(other._node_orig)
@@ -90,9 +151,115 @@ class ArrowDiGraph:
             if hasattr(incoming_graph_data, "graph"):
                 self.graph.update(incoming_graph_data.graph)
 
+    # -- keys --
+    # Canonical keys keep native Arrow scalar types: ints (bool normalizes
+    # to int, matching NetworkX ``True == 1`` node semantics), floats,
+    # strings, dates, times and datetimes. Numeric keys widen along the
+    # ``int -> float`` tower; the first otherwise-incompatible key replays
+    # the whole graph into string keys (one-time O(n) cost).
+    def _canonical_key(self, node):
+        if self._key_type is None:
+            inferred = _key_type_for(node)
+            if inferred is None:
+                self._key_type = pa.string()
+                return str(node)
+            self._key_type = inferred
+            return int(node) if isinstance(node, bool) else node
+        category = _key_category(self._key_type)
+        if category == "int":
+            if isinstance(node, bool):
+                return int(node)
+            if isinstance(node, int):
+                return node
+            if isinstance(node, float):
+                self._rekey(pa.float64())
+                return float(node)
+        elif category == "float":
+            if isinstance(node, (bool, int, float)):
+                return float(node)
+        elif category == "str":
+            return str(node)
+        elif category == "date":
+            if isinstance(node, datetime.date) and not isinstance(
+                node, datetime.datetime
+            ):
+                return node
+        elif category == "time":
+            if isinstance(node, datetime.time):
+                return node
+        elif category == "timestamp":
+            if isinstance(node, datetime.datetime):
+                return node
+        self._rekey(pa.string())
+        return str(node)
+
+    def _lookup_key(self, node):
+        """Read-only key resolution: never triggers a migration."""
+        category = _key_category(self._key_type)
+        if category == "int":
+            if isinstance(node, bool):
+                return int(node)
+            if isinstance(node, int):
+                return node
+            if isinstance(node, float):
+                # Misses unless the graph has widened; 1.0 still hits int 1
+                # per NetworkX numeric node equality.
+                return float(node)
+            return str(node)
+        if category == "float":
+            if isinstance(node, (bool, int, float)):
+                return float(node)
+            return str(node)
+        if category == "date":
+            if isinstance(node, datetime.date) and not isinstance(
+                node, datetime.datetime
+            ):
+                return node
+            return str(node)
+        if category == "time":
+            if isinstance(node, datetime.time):
+                return node
+            return str(node)
+        if category == "timestamp":
+            if isinstance(node, datetime.datetime):
+                return node
+            return str(node)
+        return str(node)
+
+    def _rekey(self, key_type):
+        """Reset key structures and replay all data under ``key_type``."""
+        nodes = [
+            (self._node_orig[k], self._node_types[i],
+             {n: c[i] for n, c in self._node_cols.items() if c[i] is not None})
+            for i, k in enumerate(self._node_order)
+        ]
+        edges = [
+            (self._node_orig[s], self._node_orig[t], self._edge_types[i],
+             {n: c[i] for n, c in self._edge_cols.items() if c[i] is not None})
+            for i, (s, t) in enumerate(self._edge_order)
+        ]
+        self._key_type = key_type
+        self._node_order = []
+        self._node_pos = {}
+        self._node_orig = {}
+        self._node_cols = {}
+        self._node_types = []
+        self._edge_order = []
+        self._edge_pos = {}
+        self._edge_cols = {}
+        self._edge_types = []
+        self._add_nodes_batch([
+            (o, {"node_type": t, **a} if t is not None else a)
+            for o, t, a in nodes
+        ])
+        self._add_edges_batch([
+            (u, v, {"edge_type": t, **a} if t is not None else a)
+            for u, v, t, a in edges
+        ])
+
     # -- nodes --
     def add_node(self, node, node_type=None, **attrs):
-        key = str(node)
+        key = self._canonical_key(node)
         if key not in self._node_orig:
             self._node_orig[key] = node
             self._node_pos[key] = len(self._node_order)
@@ -109,7 +276,7 @@ class ArrowDiGraph:
         self._nodes_dirty = True
 
     def node_type(self, node):
-        return self._node_types[self._node_pos[str(node)]]
+        return self._node_types[self._node_pos[self._lookup_key(node)]]
 
     @property
     def node_types(self):
@@ -131,31 +298,41 @@ class ArrowDiGraph:
 
     def _add_nodes_batch(self, nodes):
         """Bulk node ingest: a few list-level passes, one table build."""
-        norm = []  # (key, orig, type, attrs)
+        norm = []  # (orig, type, attrs)
         for n in nodes:
             if isinstance(n, tuple) and len(n) == 2 and isinstance(n[1], dict):
                 d = n[1]
-                norm.append((str(n[0]), n[0], d.get("node_type"), d))
+                norm.append((n[0], d.get("node_type"), d))
             else:
-                norm.append((str(n), n, None, None))
+                norm.append((n, None, None))
         if not norm:
             return
-        for key, orig, _, _ in norm:
+        kind_before = _key_category(self._key_type)
+        keyed = []  # (key, type, attrs); keys computed once here ...
+        for orig, t, d in norm:
+            key = self._canonical_key(orig)
             if key not in self._node_orig:
                 self._node_orig[key] = orig
                 self._node_pos[key] = len(self._node_order)
                 self._node_order.append(key)
+            keyed.append((key, t, d))
         new_count = len(self._node_order) - len(self._node_types)
         if new_count:
             self._node_types.extend([None] * new_count)
             for col in self._node_cols.values():
                 col.extend([None] * new_count)
-        for _, _, _, d in norm:
+        for _, _, d in keyed:
             if d:
                 for name in d:
                     if name != "node_type" and name not in self._node_cols:
                         self._node_cols[name] = [None] * len(self._node_order)
-        for key, _, t, d in norm:
+        # ... unless a migration (to strings) invalidated them mid-loop.
+        # (Numeric widening keeps keys valid via int == float equality.)
+        if kind_before != "str" and _key_category(self._key_type) == "str":
+            keyed = [
+                (self._canonical_key(orig), t, d) for orig, t, d in norm
+            ]
+        for key, t, d in keyed:
             idx = self._node_pos[key]
             if t is not None:
                 self._node_types[idx] = t
@@ -166,10 +343,10 @@ class ArrowDiGraph:
         self._nodes_dirty = True
 
     def has_node(self, node):
-        return str(node) in self._node_orig
+        return self._lookup_key(node) in self._node_orig
 
     def remove_node(self, node):
-        key = str(node)
+        key = self._lookup_key(node)
         if key not in self._node_orig:
             raise KeyError(node)
         idx = self._node_pos.pop(key)
@@ -194,7 +371,7 @@ class ArrowDiGraph:
         self._edges_dirty = True
 
     def node_attrs(self, node):
-        key = str(node)
+        key = self._lookup_key(node)
         idx = self._node_pos[key]
         d = {n: c[idx] for n, c in self._node_cols.items() if c[idx] is not None}
         if self._node_types[idx] is not None:
@@ -212,7 +389,7 @@ class ArrowDiGraph:
     def add_edge(self, u, v, edge_type=None, **attrs):
         self.add_node(u)
         self.add_node(v)
-        key = (str(u), str(v))
+        key = (self._canonical_key(u), self._canonical_key(v))
         if key not in self._edge_pos:
             self._edge_pos[key] = len(self._edge_order)
             self._edge_order.append(key)
@@ -228,7 +405,8 @@ class ArrowDiGraph:
         self._edges_dirty = True
 
     def edge_type(self, u, v):
-        return self._edge_types[self._edge_pos[(str(u), str(v))]]
+        key = (self._lookup_key(u), self._lookup_key(v))
+        return self._edge_types[self._edge_pos[key]]
 
     @property
     def edge_types(self):
@@ -260,7 +438,10 @@ class ArrowDiGraph:
             return
         self._add_nodes_batch([u for u, _, _, _ in norm] +
                               [v for _, v, _, _ in norm])
-        ekeys = [(str(u), str(v)) for u, v, _, _ in norm]
+        ekeys = [
+            (self._canonical_key(u), self._canonical_key(v))
+            for u, v, _, _ in norm
+        ]
         for key in ekeys:
             if key not in self._edge_pos:
                 self._edge_pos[key] = len(self._edge_order)
@@ -286,10 +467,10 @@ class ArrowDiGraph:
         self._edges_dirty = True
 
     def has_edge(self, u, v):
-        return (str(u), str(v)) in self._edge_pos
+        return (self._lookup_key(u), self._lookup_key(v)) in self._edge_pos
 
     def remove_edge(self, u, v):
-        key = (str(u), str(v))
+        key = (self._lookup_key(u), self._lookup_key(v))
         if key not in self._edge_pos:
             raise KeyError((u, v))
         idx = self._edge_pos.pop(key)
@@ -302,18 +483,18 @@ class ArrowDiGraph:
         self._edges_dirty = True
 
     def edge_attrs(self, u, v):
-        idx = self._edge_pos[(str(u), str(v))]
+        idx = self._edge_pos[(self._lookup_key(u), self._lookup_key(v))]
         d = {n: c[idx] for n, c in self._edge_cols.items() if c[idx] is not None}
         if self._edge_types[idx] is not None:
             d["edge_type"] = self._edge_types[idx]
         return d
 
     def successors(self, node):
-        key = str(node)
+        key = self._lookup_key(node)
         return [self._node_orig[t] for (s, t) in self._edge_order if s == key]
 
     def predecessors(self, node):
-        key = str(node)
+        key = self._lookup_key(node)
         return [self._node_orig[s] for (s, t) in self._edge_order if t == key]
 
     @property
@@ -374,12 +555,25 @@ class ArrowDiGraph:
         """Bulk-adopt Arrow tables: no per-row Python loop.
 
         The input tables become the backing tables directly; Python lookup
-        indexes are derived with vectorized ``to_pylist()`` calls. Node
-        objects are the string keys (originals are not recoverable from
-        a bare table)."""
+        indexes are derived with vectorized ``to_pylist()`` calls. The key
+        column type is preserved (int, float, string, date, time,
+        timestamp); anything else falls back to string keys. Node objects
+        are the adopted keys themselves. Edge endpoint columns are cast to
+        the node key type when they differ."""
         g = cls()
         if nodes is not None:
-            order = nodes.column("node").to_pylist()
+            node_type = nodes.schema.field("node").type
+            if _key_category(node_type) is None:
+                order = [
+                    k.decode() if isinstance(k, (bytes, bytearray)) else str(k)
+                    for k in nodes.column("node").to_pylist()
+                ]
+                g._key_type = pa.string()
+                rebuild_nodes = True
+            else:
+                order = nodes.column("node").to_pylist()
+                g._key_type = node_type
+                rebuild_nodes = False
             g._node_order = order
             g._node_pos = {k: i for i, k in enumerate(order)}
             g._node_orig = dict(zip(order, order))
@@ -393,9 +587,26 @@ class ArrowDiGraph:
                 for name in names if name not in ("node", "node_type")
             }
             g._nodes_table = nodes
+            g._nodes_dirty = rebuild_nodes
         if edges is not None:
-            src = edges.column("source").to_pylist()
-            tgt = edges.column("target").to_pylist()
+            if nodes is None:
+                endpoint_type = edges.schema.field("source").type
+                g._key_type = (
+                    endpoint_type
+                    if _key_category(endpoint_type) is not None
+                    else pa.string()
+                )
+            src = edges.column("source")
+            tgt = edges.column("target")
+            rebuild_edges = False
+            if src.type != g._key_type:
+                src = pc.cast(src, g._key_type)
+                rebuild_edges = True
+            if tgt.type != g._key_type:
+                tgt = pc.cast(tgt, g._key_type)
+                rebuild_edges = True
+            src = src.to_pylist()
+            tgt = tgt.to_pylist()
             order = list(zip(src, tgt))
             g._edge_order = order
             g._edge_pos = {k: i for i, k in enumerate(order)}
@@ -409,7 +620,7 @@ class ArrowDiGraph:
                 for name in names if name not in ("source", "target", "edge_type")
             }
             g._edges_table = edges
-        return g
+            g._edges_dirty = rebuild_edges
         return g
 
     def out_degree_table(self):
@@ -443,7 +654,8 @@ class ArrowDiGraph:
         return g
 
     def _rebuild_nodes_table(self):
-        cols = {"node": pa.array(self._node_order, type=pa.string())}
+        key_type = self._key_type if self._key_type is not None else pa.string()
+        cols = {"node": pa.array(self._node_order, type=key_type)}
         if any(t is not None for t in self._node_types):
             cols["node_type"] = pa.array(self._node_types, type=pa.string())
         for name, vals in self._node_cols.items():
@@ -451,9 +663,14 @@ class ArrowDiGraph:
         self._nodes_table = pa.table(cols)
 
     def _rebuild_edges_table(self):
+        key_type = self._key_type if self._key_type is not None else pa.string()
         cols = {
-            "source": pa.array([s for s, _ in self._edge_order], type=pa.string()),
-            "target": pa.array([t for _, t in self._edge_order], type=pa.string()),
+            "source": pa.array(
+                [s for s, _ in self._edge_order], type=key_type
+            ),
+            "target": pa.array(
+                [t for _, t in self._edge_order], type=key_type
+            ),
         }
         if any(t is not None for t in self._edge_types):
             cols["edge_type"] = pa.array(self._edge_types, type=pa.string())
