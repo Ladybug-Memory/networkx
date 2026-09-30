@@ -60,6 +60,32 @@ def test_arrow_table_roundtrip_preserves_types(typed_graph):
     assert rt.edges_of_type("follows") == [("alice", "bob")]
 
 
+def test_bulk_ingest_matches_incremental():
+    edges = [(0, 1), (1, 2), (0, 2), (2, 0)]
+    attrs = {0: {"color": "red"}, 1: {"color": "blue"}, 2: {}}
+
+    incr = ArrowDiGraph()
+    for n, d in attrs.items():
+        incr.add_node(n, **d)
+    for u, v in edges:
+        incr.add_edge(u, v, weight=1.0)
+
+    bulk = ArrowDiGraph()
+    bulk.add_nodes_from(list(attrs.items()))
+    bulk.add_edges_from([(u, v, {"weight": 1.0}) for u, v in edges])
+    assert bulk.nodes_table().equals(incr.nodes_table())
+    assert bulk.edges_table().equals(incr.edges_table())
+
+    from_nx = ArrowDiGraph(nx.DiGraph(incr.to_networkx()))
+    assert {r["node"] for r in from_nx.nodes_table().to_pylist()} == {
+        r["node"] for r in incr.nodes_table().to_pylist()
+    }
+    assert {(r["source"], r["target"]) for r in from_nx.edges_table().to_pylist()} == {
+        (r["source"], r["target"]) for r in incr.edges_table().to_pylist()
+    }
+    assert from_nx.node_attrs(0) == incr.node_attrs(0)
+
+
 def test_backend_constructors():
     g = nx.Graph(backend="arrow")
     d = nx.DiGraph(backend="arrow")

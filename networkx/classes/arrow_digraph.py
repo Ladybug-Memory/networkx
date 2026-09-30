@@ -65,10 +65,8 @@ class ArrowDiGraph:
                 incoming_graph_data = nx.convert.to_networkx_graph(
                     incoming_graph_data, create_using=nx.DiGraph
                 )
-            for n, d in incoming_graph_data.nodes(data=True):
-                self.add_node(n, **d)
-            for u, v, d in incoming_graph_data.edges(data=True):
-                self.add_edge(u, v, **d)
+            self._add_nodes_batch(incoming_graph_data.nodes(data=True))
+            self._add_edges_batch(incoming_graph_data.edges(data=True))
             if hasattr(incoming_graph_data, "graph"):
                 self.graph.update(incoming_graph_data.graph)
 
@@ -107,11 +105,43 @@ class ArrowDiGraph:
         return [self._node_orig[k] for k in keys]
 
     def add_nodes_from(self, nodes):
+        self._add_nodes_batch(nodes)
+
+    def _add_nodes_batch(self, nodes):
+        """Bulk node ingest: a few list-level passes, one table build."""
+        norm = []  # (key, orig, type, attrs)
         for n in nodes:
             if isinstance(n, tuple) and len(n) == 2 and isinstance(n[1], dict):
-                self.add_node(n[0], **n[1])
+                d = n[1]
+                norm.append((str(n[0]), n[0], d.get("node_type"), d))
             else:
-                self.add_node(n)
+                norm.append((str(n), n, None, None))
+        if not norm:
+            return
+        for key, orig, _, _ in norm:
+            if key not in self._node_orig:
+                self._node_orig[key] = orig
+                self._node_pos[key] = len(self._node_order)
+                self._node_order.append(key)
+        new_count = len(self._node_order) - len(self._node_types)
+        if new_count:
+            self._node_types.extend([None] * new_count)
+            for col in self._node_cols.values():
+                col.extend([None] * new_count)
+        for _, _, _, d in norm:
+            if d:
+                for name in d:
+                    if name != "node_type" and name not in self._node_cols:
+                        self._node_cols[name] = [None] * len(self._node_order)
+        for key, _, t, d in norm:
+            idx = self._node_pos[key]
+            if t is not None:
+                self._node_types[idx] = t
+            if d:
+                for k, v in d.items():
+                    if k != "node_type":
+                        self._node_cols[k][idx] = v
+        self._nodes_dirty = True
 
     def has_node(self, node):
         return str(node) in self._node_orig
@@ -191,11 +221,45 @@ class ArrowDiGraph:
                 for r in rows]
 
     def add_edges_from(self, ebunch):
+        self._add_edges_batch(ebunch)
+
+    def _add_edges_batch(self, ebunch):
+        """Bulk edge ingest: endpoints ensured in one node batch, then
+        edge keys/attrs merged in list-level passes, one table build."""
+        norm = []  # (u_orig, v_orig, type, attrs)
         for e in ebunch:
             if len(e) == 2:
-                self.add_edge(*e)
+                norm.append((e[0], e[1], None, None))
             else:
-                self.add_edge(e[0], e[1], **e[2])
+                norm.append((e[0], e[1], e[2].get("edge_type"), e[2]))
+        if not norm:
+            return
+        self._add_nodes_batch([u for u, _, _, _ in norm] +
+                              [v for _, v, _, _ in norm])
+        ekeys = [(str(u), str(v)) for u, v, _, _ in norm]
+        for key in ekeys:
+            if key not in self._edge_pos:
+                self._edge_pos[key] = len(self._edge_order)
+                self._edge_order.append(key)
+        new_count = len(self._edge_order) - len(self._edge_types)
+        if new_count:
+            self._edge_types.extend([None] * new_count)
+            for col in self._edge_cols.values():
+                col.extend([None] * new_count)
+        for _, _, _, d in norm:
+            if d:
+                for name in d:
+                    if name != "edge_type" and name not in self._edge_cols:
+                        self._edge_cols[name] = [None] * len(self._edge_order)
+        for (_, _, t, d), key in zip(norm, ekeys):
+            idx = self._edge_pos[key]
+            if t is not None:
+                self._edge_types[idx] = t
+            if d:
+                for k, v in d.items():
+                    if k != "edge_type":
+                        self._edge_cols[k][idx] = v
+        self._edges_dirty = True
 
     def has_edge(self, u, v):
         return (str(u), str(v)) in self._edge_pos
@@ -267,15 +331,45 @@ class ArrowDiGraph:
 
     @classmethod
     def from_arrow(cls, nodes=None, edges=None):
+        """Bulk-adopt Arrow tables: no per-row Python loop.
+
+        The input tables become the backing tables directly; Python lookup
+        indexes are derived with vectorized ``to_pylist()`` calls. Node
+        objects are the string keys (originals are not recoverable from
+        a bare table)."""
         g = cls()
         if nodes is not None:
-            pylist = nodes.to_pylist()
-            for row in pylist:
-                g.add_node(row.pop("node"), **{k: v for k, v in row.items() if v is not None})
+            order = nodes.column("node").to_pylist()
+            g._node_order = order
+            g._node_pos = {k: i for i, k in enumerate(order)}
+            g._node_orig = dict(zip(order, order))
+            names = nodes.column_names
+            g._node_types = (
+                nodes.column("node_type").to_pylist()
+                if "node_type" in names else [None] * len(order)
+            )
+            g._node_cols = {
+                name: nodes.column(name).to_pylist()
+                for name in names if name not in ("node", "node_type")
+            }
+            g._nodes_table = nodes
         if edges is not None:
-            for row in edges.to_pylist():
-                s, t = row.pop("source"), row.pop("target")
-                g.add_edge(s, t, **{k: v for k, v in row.items() if v is not None})
+            src = edges.column("source").to_pylist()
+            tgt = edges.column("target").to_pylist()
+            order = list(zip(src, tgt))
+            g._edge_order = order
+            g._edge_pos = {k: i for i, k in enumerate(order)}
+            names = edges.column_names
+            g._edge_types = (
+                edges.column("edge_type").to_pylist()
+                if "edge_type" in names else [None] * len(order)
+            )
+            g._edge_cols = {
+                name: edges.column(name).to_pylist()
+                for name in names if name not in ("source", "target", "edge_type")
+            }
+            g._edges_table = edges
+        return g
         return g
 
     def out_degree_table(self):

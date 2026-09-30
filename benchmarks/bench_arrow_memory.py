@@ -46,6 +46,12 @@ def build_pair(n, seed=0):
     tracemalloc.stop()
     t_dict = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
+    bulk = ArrowDiGraph(d)
+    t_bulk = time.perf_counter() - t0
+    assert bulk.number_of_nodes() == a.number_of_nodes()
+    assert bulk.number_of_edges() == a.number_of_edges()
+
     arrow_bytes = a.nodes_table().nbytes + a.edges_table().nbytes
     dict_bytes = sys.getsizeof(d._node) + sys.getsizeof(d._succ) + sys.getsizeof(
         d._pred
@@ -59,6 +65,7 @@ def build_pair(n, seed=0):
         "peak_dict_build": peak_dict,
         "build_arrow_s": t_arrow,
         "build_dict_s": t_dict,
+        "bulk_arrow_s": t_bulk,
     }
 
 
@@ -90,6 +97,8 @@ def main():
     print(f"bulk build peak: arrow {m['peak_arrow_build'] / 1e6:.1f}MB "
           f"vs dict {m['peak_dict_build'] / 1e6:.1f}MB")
     print(f"bulk build time: arrow {m['build_arrow_s']:.2f}s vs dict {m['build_dict_s']:.2f}s")
+    print(f"bulk load ArrowDiGraph(nx_graph): {m['bulk_arrow_s']:.2f}s "
+          f"({m['build_arrow_s'] / max(m['bulk_arrow_s'], 1e-9):.1f}x faster than incremental)")
     tw_arrow, tw_dict = bench_writes(a, d)
     print(f"single-edge writes (2000): arrow {tw_arrow:.3f}s vs dict {tw_dict:.3f}s")
     if tw_arrow > tw_dict:
